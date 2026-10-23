@@ -77,6 +77,7 @@ REVIEWERS_AVAILABLE = None         # people who can do reviews; None = do not co
 # The reviewer is assumed to always decide correctly, so a review costs only their time.
 
 GRID = np.round(np.linspace(0.0, 1.0, 101), 2)
+CONFUSION_CONF = 0.25  # confidence at which the per-class confusion matrix is counted
 
 
 # ----------------------------------------------------------------------------
@@ -125,7 +126,7 @@ def load_truth(root: Path, split: str, names: list[str]) -> tuple[list[str], np.
 # ----------------------------------------------------------------------------
 # 2. Finetuning
 # ----------------------------------------------------------------------------
-def train_model(yaml_path: Path) -> Path:
+def train_model(yaml_path: Path) -> tuple[Path, dict]:
     from ultralytics import YOLO
 
     model = YOLO(BASE_MODEL)
@@ -137,7 +138,11 @@ def train_model(yaml_path: Path) -> Path:
     WEIGHTS_DIR.mkdir(exist_ok=True)
     final = WEIGHTS_DIR / "best.pt"
     shutil.copy(Path(model.trainer.best), final)
-    return final
+    info = {
+        "epochs_run": int(model.trainer.epoch) + 1,  # early stopping may end before EPOCHS
+        "best_epoch": int(model.trainer.stopper.best_epoch),  # Ultralytics already counts from 1
+    }
+    return final, info
 
 
 # ----------------------------------------------------------------------------
@@ -147,10 +152,9 @@ def detection_metrics(model, yaml_path: Path, split: str) -> dict:
     """Ultralytics validation. Precision and recall are at the confidence that
     maximises F1 for each class (Ultralytics' convention), not at a fixed threshold."""
     ultralytics_split = "val" if split == "valid" else split  # the key used in data_abs.yaml
-    m = model.val(
-        data=str(yaml_path), split=ultralytics_split, imgsz=IMGSZ, conf=0.001, iou=0.6,
-        plots=False, verbose=False, project=str(ROOT / "runs"), name=f"val_{split}", exist_ok=True,
-    )
+    common = dict(data=str(yaml_path), split=ultralytics_split, imgsz=IMGSZ, iou=0.6,
+                  verbose=False, project=str(ROOT / "runs"), exist_ok=True)
+    m = model.val(conf=0.001, plots=False, name=f"val_{split}", **common)
     per_class = []
     for i, class_index in enumerate(m.box.ap_class_index):
         per_class.append({
@@ -158,12 +162,17 @@ def detection_metrics(model, yaml_path: Path, split: str) -> dict:
             "precision": float(m.box.p[i]), "recall": float(m.box.r[i]),
             "ap50": float(m.box.ap50[i]), "ap50_95": float(m.box.ap[i]),
         })
+    # Ultralytics only fills its confusion matrix when plots=True, and counts every box
+    # above the confidence it is given. So the matrix comes from a second pass at an
+    # explicit confidence, not from the 0.001 used for mAP.
+    c = model.val(conf=CONFUSION_CONF, plots=True, name=f"confusion_{split}", **common)
     return {
         "map50": float(m.box.map50), "map50_95": float(m.box.map),
         "per_class": per_class,
-        "confusion_matrix": m.confusion_matrix.matrix.tolist(),
-        "confusion_labels": [m.names[i] for i in sorted(m.names)] + ["background"],
-        "confusion_conf": float(getattr(m.confusion_matrix, "conf", float("nan"))),
+        "confusion_matrix": c.confusion_matrix.matrix.tolist(),
+        "confusion_labels": [c.names[i] for i in sorted(c.names)] + ["background"],
+        "confusion_conf": CONFUSION_CONF,
+        "confusion_axes": "rows = predicted class, columns = true class, last = background",
     }
 
 
@@ -385,7 +394,7 @@ def main() -> None:
 
     from ultralytics import YOLO
 
-    weights = train_model(yaml_path)
+    weights, training = train_model(yaml_path)
     model = YOLO(str(weights))
 
     detection = {split: detection_metrics(model, yaml_path, split) for split in ("valid", "test")}
@@ -415,7 +424,7 @@ def main() -> None:
     design["single"]["test_fpr_ci95"] = clopper_pearson(k_fp, n_neg)
 
     results = {
-        "dataset": dataset_stats, "environment": environment(),
+        "dataset": dataset_stats, "environment": {**environment(), **training},
         "assumptions": {"costs": costs, "base_rate": BASE_RATE, "cases_per_day": CASES_PER_DAY,
                         "work_minutes_per_day": WORK_MINUTES_PER_DAY, "reviewers_available": REVIEWERS_AVAILABLE,
                         "negative_classes": sorted(NEGATIVE_CLASSES), "ignored_classes": sorted(IGNORED_CLASSES)},
